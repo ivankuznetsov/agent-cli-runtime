@@ -1,0 +1,152 @@
+name: Mirror a component release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing component version, including the leading v
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-cli-runtime-mirror-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'ivankuznetsov/agent-cli-runtime'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the distribution mirror
+        uses: actions/checkout@v7
+        with:
+          path: mirror
+          fetch-depth: 0
+
+      - name: Check out the canonical component tag
+        uses: actions/checkout@v7
+        with:
+          repository: ivankuznetsov/hive
+          ref: components/agent-cli-runtime/${{ inputs.version }}
+          path: hive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: Validate release identity
+        id: release
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid version: $VERSION" >&2
+            exit 1
+          fi
+          actual="$(
+            ruby -Ihive/components/agent-cli-runtime/lib \
+              -ragent_cli_runtime/version \
+              -e 'print AgentCliRuntime::VERSION'
+          )"
+          if test "v$actual" != "$VERSION"; then
+            echo "tag/source version mismatch: $VERSION != v$actual" >&2
+            exit 1
+          fi
+          source_commit="$(git -C hive rev-parse HEAD)"
+          echo "version=$actual" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Create the exact release snapshot tag
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+        shell: bash
+        run: |
+          remote_manifest="$(
+            git -C mirror show "refs/tags/$VERSION:.mirror-source.json" \
+              2>/dev/null || true
+          )"
+          if test -n "$remote_manifest"; then
+            recorded="$(
+              ruby -rjson -e \
+                'print JSON.parse(STDIN.read).fetch("source_commit")' \
+                <<<"$remote_manifest"
+            )"
+            test "$recorded" = "$SOURCE_COMMIT"
+            echo "Verified existing mirror tag $VERSION."
+            exit 0
+          fi
+
+          cp mirror/.github/mirror/sync.rb \
+            "$RUNNER_TEMP/agent-cli-runtime-mirror-sync.rb"
+          git -C mirror config user.name "github-actions[bot]"
+          git -C mirror config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C mirror switch --orphan \
+            "mirror-release-${{ steps.release.outputs.version }}"
+          git -C mirror rm -rf .
+          ruby "$RUNNER_TEMP/agent-cli-runtime-mirror-sync.rb" \
+            hive/components/agent-cli-runtime \
+            mirror \
+            "$SOURCE_COMMIT" \
+            --release
+          git -C mirror add --all
+          git -C mirror commit -m \
+            "Mirror agent-cli-runtime $VERSION"
+          git -C mirror tag "$VERSION"
+          git -C mirror push origin "refs/tags/$VERSION"
+
+      - name: Verify the release snapshot
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          snapshot="$RUNNER_TEMP/release-snapshot"
+          mkdir -p "$snapshot"
+          git -C mirror archive "$VERSION" | tar -x -C "$snapshot"
+          (
+            cd "$snapshot"
+            gem build agent-cli-runtime.gemspec \
+              --output "$RUNNER_TEMP/agent-cli-runtime.gem"
+          )
+          gem install "$RUNNER_TEMP/agent-cli-runtime.gem" \
+            --install-dir "$RUNNER_TEMP/gem-home" \
+            --no-document
+          GEM_HOME="$RUNNER_TEMP/gem-home" \
+            GEM_PATH="$RUNNER_TEMP/gem-home" \
+            "$RUNNER_TEMP/gem-home/bin/agent-runtime" --version |
+            grep -Fx "${{ steps.release.outputs.version }}"
+
+      - name: Create the mirror GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Mirror release $VERSION already exists."
+            exit 0
+          fi
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "agent-cli-runtime $VERSION" \
+            --notes "Read-only source snapshot of the component release from the Hive monorepo.
+
+Install from RubyGems:
+
+\`\`\`sh
+gem install agent-cli-runtime --version ${{ steps.release.outputs.version }}
+\`\`\`
+
+Canonical development and release authority remain in https://github.com/ivankuznetsov/hive."
