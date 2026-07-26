@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           path: mirror
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Check out canonical Hive main
         uses: actions/checkout@v7
@@ -33,6 +33,7 @@ jobs:
           path: hive
           fetch-depth: 0
           persist-credentials: false
+          sparse-checkout: components/agent-cli-runtime
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1

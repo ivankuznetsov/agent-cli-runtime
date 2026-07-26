@@ -36,6 +36,7 @@ jobs:
           path: hive
           fetch-depth: 1
           persist-credentials: false
+          sparse-checkout: components/agent-cli-runtime
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
