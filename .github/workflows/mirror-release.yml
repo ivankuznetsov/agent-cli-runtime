@@ -93,7 +93,7 @@ jobs:
             "41898282+github-actions[bot]@users.noreply.github.com"
           git -C mirror switch --orphan \
             "mirror-release-${{ steps.release.outputs.version }}"
-          git -C mirror rm -rf .
+          git -C mirror rm -rf --ignore-unmatch .
           ruby "$RUNNER_TEMP/agent-cli-runtime-mirror-sync.rb" \
             hive/components/agent-cli-runtime \
             mirror \
