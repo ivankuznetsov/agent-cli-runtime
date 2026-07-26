@@ -137,16 +137,20 @@ jobs:
             echo "Mirror release $VERSION already exists."
             exit 0
           fi
+          notes="$RUNNER_TEMP/release-notes.md"
+          printf '%s\n' \
+            "Read-only source snapshot of the component release from the Hive monorepo." \
+            "" \
+            "Install from RubyGems:" \
+            "" \
+            '```sh' \
+            "gem install agent-cli-runtime --version ${{ steps.release.outputs.version }}" \
+            '```' \
+            "" \
+            "Canonical development and release authority remain in https://github.com/ivankuznetsov/hive." \
+            > "$notes"
           gh release create "$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "agent-cli-runtime $VERSION" \
-            --notes "Read-only source snapshot of the component release from the Hive monorepo.
-
-Install from RubyGems:
-
-\`\`\`sh
-gem install agent-cli-runtime --version ${{ steps.release.outputs.version }}
-\`\`\`
-
-Canonical development and release authority remain in https://github.com/ivankuznetsov/hive."
+            --notes-file "$notes"
