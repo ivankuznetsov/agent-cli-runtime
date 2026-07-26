@@ -23,23 +23,23 @@ jobs:
 
     steps:
       - name: Check out the distribution mirror
-        uses: actions/checkout@v7
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
           path: mirror
           fetch-depth: 0
 
       - name: Check out the canonical component tag
-        uses: actions/checkout@v7
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
           repository: ivankuznetsov/hive
           ref: components/agent-cli-runtime/${{ inputs.version }}
           path: hive
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
           sparse-checkout: components/agent-cli-runtime
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # pinned 2026-07-26
         with:
           ruby-version: "3.4"
 
@@ -66,45 +66,91 @@ jobs:
           echo "version=$actual" >> "$GITHUB_OUTPUT"
           echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
 
-      - name: Create the exact release snapshot tag
+      - name: Require the component tag on canonical main
+        env:
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C hive fetch --no-tags --force origin \
+            +refs/heads/main:refs/remotes/origin/main
+          if ! git -C hive merge-base --is-ancestor \
+            "$SOURCE_COMMIT" refs/remotes/origin/main; then
+            echo "component tag is not reachable from canonical main" >&2
+            exit 1
+          fi
+
+      - name: Require the exact version on RubyGems
+        env:
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            --connect-timeout 5 \
+            --max-time 20 \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-max-time 60 \
+            --retry-all-errors \
+            https://rubygems.org/api/v1/versions/agent-cli-runtime.json |
+            ruby -rjson -e '
+              expected = ARGV.fetch(0)
+              versions = JSON.parse(STDIN.read)
+              abort "RubyGems does not contain exact version #{expected}" unless
+                versions.any? { |version| version.fetch("number") == expected }
+            ' "$EXPECTED_VERSION"
+
+      - name: Create and compare the exact release snapshot tag locally
         env:
           VERSION: ${{ inputs.version }}
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         shell: bash
         run: |
-          remote_manifest="$(
-            git -C mirror show "refs/tags/$VERSION:.mirror-source.json" \
-              2>/dev/null || true
-          )"
-          if test -n "$remote_manifest"; then
-            recorded="$(
-              ruby -rjson -e \
-                'print JSON.parse(STDIN.read).fetch("source_commit")' \
-                <<<"$remote_manifest"
+          set -euo pipefail
+          sync="$RUNNER_TEMP/agent-cli-runtime-mirror-sync.rb"
+          expected="$RUNNER_TEMP/expected-release-snapshot"
+          cp mirror/.github/mirror/sync.rb "$sync"
+          git init -q "$expected"
+          ruby "$sync" \
+            hive/components/agent-cli-runtime \
+            "$expected" \
+            "$SOURCE_COMMIT" \
+            --release
+          git -C "$expected" add --all
+          expected_tree="$(git -C "$expected" write-tree)"
+
+          if git -C mirror rev-parse --verify --quiet \
+            "refs/tags/$VERSION^{commit}" >/dev/null; then
+            actual_tree="$(
+              git -C mirror rev-parse "refs/tags/$VERSION^{tree}"
             )"
-            test "$recorded" = "$SOURCE_COMMIT"
-            echo "Verified existing mirror tag $VERSION."
+            test "$actual_tree" = "$expected_tree"
+            echo "Existing mirror tag $VERSION exactly matches the canonical snapshot."
             exit 0
           fi
 
-          cp mirror/.github/mirror/sync.rb \
-            "$RUNNER_TEMP/agent-cli-runtime-mirror-sync.rb"
           git -C mirror config user.name "github-actions[bot]"
           git -C mirror config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
           git -C mirror switch --orphan \
             "mirror-release-${{ steps.release.outputs.version }}"
           git -C mirror rm -rf --ignore-unmatch .
-          ruby "$RUNNER_TEMP/agent-cli-runtime-mirror-sync.rb" \
+          ruby "$sync" \
             hive/components/agent-cli-runtime \
             mirror \
             "$SOURCE_COMMIT" \
             --release
           git -C mirror add --all
+          actual_tree="$(git -C mirror write-tree)"
+          test "$actual_tree" = "$expected_tree"
           git -C mirror commit -m \
             "Mirror agent-cli-runtime $VERSION"
           git -C mirror tag "$VERSION"
-          git -C mirror push origin "refs/tags/$VERSION"
+          tag_tree="$(
+            git -C mirror rev-parse "refs/tags/$VERSION^{tree}"
+          )"
+          test "$tag_tree" = "$expected_tree"
 
       - name: Verify the release snapshot
         env:
@@ -126,6 +172,14 @@ jobs:
             GEM_PATH="$RUNNER_TEMP/gem-home" \
             "$RUNNER_TEMP/gem-home/bin/agent-runtime" --version |
             grep -Fx "${{ steps.release.outputs.version }}"
+
+      - name: Push the verified release snapshot tag
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C mirror push origin "refs/tags/$VERSION"
 
       - name: Create the mirror GitHub release
         env:

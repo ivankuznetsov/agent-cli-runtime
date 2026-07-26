@@ -32,9 +32,11 @@ module AgentCliRuntimeMirror
     reject_source_symlinks!(source)
 
     release = mode == "--release"
-    admin_available = ADMIN_FILES.keys.all? do |path|
-      File.file?(File.join(source, "mirror", path))
+    admin_presence = ADMIN_FILES.keys.to_h do |path|
+      [ path, File.file?(File.join(source, "mirror", path)) ]
     end
+    reject_partial_admin!(admin_presence) unless release
+    admin_available = admin_presence.values.all?
     preserve = [ ".git" ]
     preserve.concat([ ".github", "CONTRIBUTING.md", "SECURITY.md" ]) unless release || admin_available
 
@@ -68,6 +70,13 @@ module AgentCliRuntimeMirror
     abort "destination .git must be a real directory" unless state.directory? && !state.symlink?
   rescue Errno::ENOENT
     abort "destination is not a Git checkout: #{destination}"
+  end
+
+  def reject_partial_admin!(admin_presence)
+    return if admin_presence.values.none? || admin_presence.values.all?
+
+    missing = admin_presence.reject { |_path, present| present }.keys.sort
+    abort "source mirror administration is incomplete: missing #{missing.join(", ")}"
   end
 
   def reject_source_symlinks!(source)

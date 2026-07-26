@@ -20,13 +20,13 @@ jobs:
 
     steps:
       - name: Check out the distribution mirror
-        uses: actions/checkout@v7
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
           path: mirror
           fetch-depth: 1
 
       - name: Check out canonical Hive main
-        uses: actions/checkout@v7
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
           repository: ivankuznetsov/hive
           ref: main
@@ -36,7 +36,7 @@ jobs:
           sparse-checkout: components/agent-cli-runtime
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # pinned 2026-07-26
         with:
           ruby-version: "3.4"
 
