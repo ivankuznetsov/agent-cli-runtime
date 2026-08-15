@@ -1,0 +1,235 @@
+#!/usr/bin/env ruby
+
+require "digest"
+require "fileutils"
+require "json"
+require "open3"
+require "rubygems/package"
+require "tmpdir"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "agent_cli_runtime/version"
+
+gem_path = File.expand_path(ARGV.fetch(0) {
+  abort "usage: verify-candidate PATH_TO_GEM [EXPECTED_SHA256]"
+})
+expected_sha = ARGV[1]
+abort "candidate gem not found: #{gem_path}" unless File.file?(gem_path)
+
+sha256 = Digest::SHA256.file(gem_path).hexdigest
+if expected_sha && sha256 != expected_sha
+  abort "candidate sha256 mismatch: expected #{expected_sha}, got #{sha256}"
+end
+
+package = Gem::Package.new(gem_path)
+spec = package.spec
+abort "wrong gem name: #{spec.name}" unless spec.name == "agent-cli-runtime"
+abort "wrong gem version: #{spec.version}" unless
+  spec.version.to_s == AgentCliRuntime::VERSION
+abort "wrong executable inventory" unless spec.executables == [ "agent-runtime" ]
+abort "wrong Ruby requirement" unless
+  spec.required_ruby_version == Gem::Requirement.new(">= 3.4.0")
+
+required = %w[
+  README.md
+  CHANGELOG.md
+  LICENSE.txt
+  agent-cli-runtime.gemspec
+  exe/agent-runtime
+  lib/agent_cli_runtime.rb
+  lib/agent_cli_runtime/version.rb
+]
+missing = required - spec.files
+abort "candidate missing files: #{missing.join(', ')}" unless missing.empty?
+unexpected = spec.files.grep(%r{\A(?:test|dist)/})
+abort "candidate contains repository-only files: #{unexpected.join(', ')}" unless
+  unexpected.empty?
+
+dependencies = spec.runtime_dependencies.map(&:name).sort
+abort "wrong runtime dependencies: #{dependencies.inspect}" unless
+  dependencies == %w[json open3 timeout]
+
+Dir.mktmpdir("agent-cli-runtime-candidate") do |sandbox|
+  gem_home = File.join(sandbox, "gems")
+  bin_dir = File.join(sandbox, "bin")
+  FileUtils.mkdir_p([ gem_home, bin_dir ])
+  bundler_environment = ENV.keys.grep(/\A(?:BUNDLE|BUNDLER_)/).to_h do |key|
+    [ key, nil ]
+  end
+  install_env = bundler_environment.merge(
+    "GEM_HOME" => gem_home,
+    "GEM_PATH" => gem_home,
+    "RUBYGEMS_GEMDEPS" => nil,
+    "RUBYLIB" => nil,
+    "RUBYOPT" => nil
+  )
+  install_command = [
+    Gem.ruby, "-S", "gem", "install", gem_path,
+    "--install-dir", gem_home,
+    "--bindir", bin_dir,
+    "--no-document",
+    "--source", "https://rubygems.org"
+  ]
+  install_out, install_err, install_status =
+    Open3.capture3(install_env, *install_command)
+  abort "#{install_out}\n#{install_err}" unless install_status.success?
+
+  runtime_env = install_env.merge(
+    "PATH" => "#{bin_dir}#{File::PATH_SEPARATOR}#{ENV.fetch('PATH', '')}"
+  )
+  require_script = <<~RUBY
+    require "agent_cli_runtime"
+    abort "Hive loaded unexpectedly" if defined?(Hive)
+    abort "wrong version" unless
+      AgentCliRuntime::VERSION == #{AgentCliRuntime::VERSION.dump}
+    abort "wrong providers" unless
+      AgentCliRuntime::Profiles.names == %i[claude codex pi grok opencode]
+  RUBY
+  _out, err, status = Open3.capture3(
+    runtime_env, Gem.ruby, "-e", require_script
+  )
+  abort err unless status.success?
+
+  version_out, version_err, version_status = Open3.capture3(
+    runtime_env, File.join(bin_dir, "agent-runtime"), "--version"
+  )
+  abort version_err unless version_status.success?
+  abort "wrong CLI version: #{version_out.inspect}" unless
+    version_out == "#{AgentCliRuntime::VERSION}\n"
+
+  probe_env = runtime_env.merge(
+    "AGENT_CLI_RUNTIME_CODEX_BIN" => "/missing/codex"
+  )
+  probe_out, probe_err, probe_status = Open3.capture3(
+    probe_env,
+    File.join(bin_dir, "agent-runtime"),
+    "probe", "codex", "--json"
+  )
+  abort probe_err unless probe_err.empty?
+  abort "missing prerequisite probe should exit 1" unless
+    probe_status.exitstatus == 1
+  payload = JSON.parse(probe_out)
+  abort "wrong CLI schema" unless payload["schema_version"] == 1
+  abort "wrong CLI provider" unless
+    payload.fetch("probes").map { |probe| probe["provider"] } == [ "codex" ]
+
+  fake_opencode = File.join(sandbox, "fake-opencode")
+  File.write(fake_opencode, <<~RUBY)
+    #!#{Gem.ruby} --disable-gems
+    require "json"
+    case ARGV
+    when ["--version"]
+      puts "opencode 1.18.16"
+    when ["run", "--help"]
+      puts "--model --variant --format --dir --pure --auto"
+    when ["export", "--help"]
+      puts "--sanitize"
+    when ["auth", "list"]
+      puts "anthropic"
+    when ["models", "anthropic", "--verbose"]
+      puts "anthropic/claude-sonnet-4-5"
+      puts JSON.generate("variants" => { "high" => {} })
+    else
+      warn "unexpected candidate OpenCode probe: \#{ARGV.inspect}"
+      exit 64
+    end
+  RUBY
+  FileUtils.chmod(0o755, fake_opencode)
+
+  lifecycle_script = <<~'RUBY'
+    require "agent_cli_runtime"
+    require "fileutils"
+    require "json"
+    require "tmpdir"
+
+    route = "anthropic/claude-sonnet-4-5"
+    Dir.mktmpdir("agent-cli-runtime-installed-lifecycle") do |dir|
+      work = File.join(dir, "work")
+      root = File.join(dir, "invocation")
+      FileUtils.mkdir_p(work)
+      request = AgentCliRuntime::OpenCodePreparationRequest.new(
+        request: AgentCliRuntime::Request.new(
+          profile: :opencode, prompt: "verify installed lifecycle",
+          permission_mode: "workspace-write", model: route, effort: "high"
+        ),
+        working_directory: work,
+        invocation_root: root,
+        configuration: {
+          "provider" => { "anthropic" => { "npm" => "@ai-sdk/anthropic" } }
+        },
+        credential_environment_keys: ["ANTHROPIC_API_KEY"]
+      )
+      prepared = AgentCliRuntime.prepare!(request, env: ENV)
+      begin
+        abort "installed candidate probe was not ready" unless prepared.probe_result.ready
+        policy = JSON.parse(File.binread(prepared.configuration_path)).fetch("permission")
+        abort "installed candidate edit policy was not worktree-relative" unless
+          policy.dig("edit", "**") == "allow"
+
+        stdout = [
+          { type: "step_start", sessionID: "ses_candidate", part: {
+            id: "part_start", sessionID: "ses_candidate",
+            messageID: "msg_candidate", type: "step-start"
+          } },
+          { type: "text", sessionID: "ses_candidate", part: {
+            id: "part_text", sessionID: "ses_candidate",
+            messageID: "msg_candidate", type: "text", text: "Done."
+          } },
+          { type: "step_finish", sessionID: "ses_candidate", part: {
+            id: "part_finish", sessionID: "ses_candidate",
+            messageID: "msg_candidate", type: "step-finish", reason: "stop",
+            cost: 0.0, tokens: {
+              input: 5, output: 2, reasoning: 0,
+              cache: { read: 1, write: 0 }
+            }
+          } }
+        ].map { |event| JSON.generate(event) }.join("\n") << "\n"
+        export = JSON.generate(
+          "info" => { "id" => "ses_candidate" },
+          "messages" => [
+            { "info" => {
+              "id" => "msg_candidate", "sessionID" => "ses_candidate",
+              "role" => "assistant", "providerID" => "anthropic",
+              "modelID" => "claude-sonnet-4-5", "finish" => "stop",
+              "tokens" => { "input" => 5, "output" => 2,
+                            "cache" => { "read" => 1, "write" => 0 } },
+              "cost" => 0.0
+            } }
+          ]
+        )
+        outcome = AgentCliRuntime.normalize(
+          :opencode,
+          AgentCliRuntime::CapturedResult.new(
+            stdout: stdout, stderr: "",
+            termination: AgentCliRuntime::TerminationEvidence.new(exit_code: 0),
+            inspection_output: export
+          ),
+          requested_route: route
+        )
+        abort "installed candidate did not normalize a completed run" unless
+          outcome.kind == :completed && outcome.identity.actual.to_s == route &&
+          outcome.usage.input == 5 && outcome.final_message == "Done."
+      ensure
+        prepared&.cleanup!
+      end
+      abort "installed candidate did not clean its invocation root" if File.exist?(root)
+    end
+  RUBY
+  lifecycle_env = runtime_env.merge(
+    "AGENT_CLI_RUNTIME_OPENCODE_BIN" => fake_opencode,
+    "ANTHROPIC_API_KEY" => "candidate-placeholder"
+  )
+  _out, lifecycle_err, lifecycle_status = Open3.capture3(
+    lifecycle_env, Gem.ruby, "-e", lifecycle_script
+  )
+  abort lifecycle_err unless lifecycle_status.success?
+end
+
+puts JSON.generate(
+  schema_version: 1,
+  gem: gem_path,
+  name: spec.name,
+  version: spec.version.to_s,
+  sha256: sha256
+)
