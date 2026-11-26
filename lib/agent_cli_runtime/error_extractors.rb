@@ -1,0 +1,154 @@
+module AgentCliRuntime
+  # Provider-side failures that a CLI reports on its event stream while still
+  # exiting zero. Each profile owns the shape its own CLI emits. Extractors
+  # return either the raw provider text, an ExtractedFailure, or nil when the
+  # event carries no failure. Runtime.extract_provider_error normalizes and
+  # redacts the result.
+  module ErrorExtractors
+    module_function
+
+    # CLIs that name the failure with a dedicated event type. This is the same
+    # set Hive scanned for inline before provider shape moved behind the
+    # profile, so wiring a profile to DEFAULT preserves its behaviour.
+    DEFAULT = lambda do |event|
+      next nil unless event.is_a?(Hash)
+
+      case event["type"]
+      when "error", "turn.failed", "rate_limit_event"
+        ErrorExtractors.message_from(event)
+      when "result"
+        if event["is_error"] == true || event["subtype"].to_s.start_with?("error")
+          ErrorExtractors.message_from(event)
+        end
+      end
+    end
+
+    # Claude's subscription wall is a dedicated structured event with no
+    # human-readable message. The generic extractor therefore returned nil,
+    # leaving callers to flatten a rejected five-hour/seven-day window into a
+    # generic exit-code failure. Accept only the exact rejected account-window
+    # shapes observed from Claude Code and synthesize bounded provider text for
+    # the normal typed limit path. Other Claude errors retain DEFAULT behavior.
+    CLAUDE_ACCOUNT_LIMIT_TYPES = %w[five_hour seven_day].freeze
+    CLAUDE = lambda do |event|
+      if event.is_a?(Hash) && event["type"] == "rate_limit_event"
+        info = event["rate_limit_info"]
+        if info.is_a?(Hash) && info["status"] == "rejected"
+          limit_type = info["rateLimitType"].to_s
+          if CLAUDE_ACCOUNT_LIMIT_TYPES.include?(limit_type)
+            next ExtractedFailure.new(
+              kind: :provider_limit,
+              message: "Claude account quota reached (#{limit_type})"
+            )
+          end
+        end
+      end
+
+      DEFAULT.call(event)
+    end
+
+    # Codex reports each transport retry as its own "error" event
+    # ("Reconnecting... 2/5 (stream disconnected ...)") before the terminal
+    # error and turn.failed. Callers keep the first provider error, so a
+    # retry notice used to mask the real failure (for example a 401 from a
+    # revoked login). Retry notices are progress, not the failure.
+    CODEX_RETRY_NOTICE = /\AReconnecting\.\.\.\s*\d+\s*\/\s*\d+\b/
+    CODEX = lambda do |event|
+      text = DEFAULT.call(event)
+      next nil if text.is_a?(String) && text.match?(CODEX_RETRY_NOTICE)
+
+      text
+    end
+
+    # pi keeps the envelope type ("message_start"/"message_end") and moves the
+    # terminal state into stopReason. Provider refusals use
+    # stopReason=error/errorMessage. A model that consumes its entire output
+    # allowance uses stopReason=length and can exit zero without executing the
+    # final write tool. Matching on type alone sees neither failure.
+    PI = lambda do |event|
+      next nil unless event.is_a?(Hash)
+
+      message = event["message"].is_a?(Hash) ? event["message"] : event
+      case message["stopReason"].to_s
+      when "error"
+        ErrorExtractors.message_from(message) || ErrorExtractors.message_from(event)
+      when "length"
+        ExtractedFailure.new(
+          kind: :model_output_limit,
+          message: "model response reached its maximum output tokens"
+        )
+      end
+    end
+
+    # OpenCode 1.x keeps provider failures under error.data.message; 2.x
+    # flattens them to error.message (with error.type and error.status).
+    # Read only the dedicated error event so ordinary model text cannot forge
+    # a provider-limit signal.
+    OPENCODE = lambda do |event|
+      next nil unless event.is_a?(Hash) && event["type"] == "error"
+
+      ErrorExtractors.opencode_error_message(event["error"])
+    end
+
+    # Muse terminates every headless run with one `run.terminal.*` event.
+    # Only that run-level terminal is authoritative: `task.lifecycle.failed`
+    # also fires for internal reminder children on otherwise successful
+    # runs, so task-level failures must never become provider errors.
+    MUSE = lambda do |event|
+      next nil unless event.is_a?(Hash)
+      next nil unless event["payload_type"].to_s.start_with?("run.terminal.")
+
+      payload = event["payload"]
+      next nil unless payload.is_a?(Hash)
+
+      terminal = payload["terminal"].to_s
+      next nil if terminal.empty? || terminal == "completed"
+
+      reason = payload["reason"].to_s.strip
+      reason.empty? ? "muse run #{terminal}" : reason
+    end
+
+    # Antigravity CLI (`agy`) terminates every stream-json run with an
+    # `{"event":"result","result":{...}}` envelope. Non-SUCCESS statuses
+    # (`ERROR`, `CANCELED`, etc.) carry the provider/CLI diagnostic in
+    # `result.error`.
+    AGY = lambda do |event|
+      next nil unless event.is_a?(Hash)
+
+      case event["event"]
+      when "result"
+        result = event["result"]
+        next nil unless result.is_a?(Hash)
+
+        status = result["status"].to_s.upcase
+        next nil if status.empty? || status == "SUCCESS"
+
+        message = result["error"].to_s.strip
+        message.empty? ? "agy run #{status.downcase}" : message
+      when "error"
+        ErrorExtractors.message_from(event)
+      end
+    end
+
+    def opencode_error_message(error)
+      return nil unless error.is_a?(Hash)
+
+      data = error["data"]
+      message = data.is_a?(Hash) ? data["message"] : error["message"]
+      message if message.is_a?(String) && !message.strip.empty?
+    end
+
+    def message_from(event)
+      return nil unless event.is_a?(Hash)
+
+      candidates = [
+        event["errorMessage"],
+        event["message"],
+        event.dig("error", "message"),
+        event["error"]
+      ]
+      text = candidates.find { |value| value.is_a?(String) && !value.strip.empty? }
+      text&.strip
+    end
+  end
+end

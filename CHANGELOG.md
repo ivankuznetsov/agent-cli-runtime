@@ -1,0 +1,135 @@
+# Changelog
+
+## Unreleased
+
+## 0.2.5 - 2026-11-26
+
+Adds built-in **Antigravity CLI (`agy`)** and **Muse Code (`muse`)** providers alongside OpenCode 2.x compatibility and sharper provider error and environment handling. All changes are additive and backwards-compatible with `~> 0.2.0` consumers.
+
+### New providers
+
+- **Antigravity CLI (`:agy`)**: Seventh built-in provider, appended after `:muse` without changing existing provider ordering. Compiles headless print mode (`agy --input-format=text --dangerously-skip-permissions --output-format stream-json`) over piped stdin so large prompts stay out of `argv`, with repeatable `--add-dir`, `--model`, and `--effort` flags. Includes binary-safe OAuth token probing (`~/.gemini/antigravity-cli/antigravity-oauth-token`), `step_update`/`result` usage extraction (`input_tokens`, `output_tokens`, `thinking_tokens` as `reasoning`, `cache_read_tokens` as `cache_read`, `output_includes_reasoning: true`), and non-`SUCCESS` `result` error extraction. Scoped `read-only` / `workspace-write` flags fail closed.
+- **Muse Code (`:muse`)**: Sixth built-in provider, appended after `:opencode`. Compiles `muse exec --prompt-file=/dev/stdin --json` with tempfile-backed stdin, model and reasoning-effort pinning, sandboxed `workspace-write` and `read-only` modes, `run.usage` per-model token aggregation, `run.terminal` error extraction, and XDG config/data resolution. Adds three reusable profile hooks: dual-form version parsing (when one numeric core appears twice, e.g. `1.4.14 (1.4.14-R7309.1)`), `configuration_directory_probe`, and `prompt_argument`.
+
+### Provider compatibility & error handling
+
+- **OpenCode 2.x private servers (`--standalone`)**: The route probe detects `--standalone` from `run --help`, records `:private_server` capability evidence, and threads the flag through `auth list`, `models`, prepared `run`, and sanitized `export` so isolated runs do not collide with OpenCode 2.x's shared background server. OpenCode 1.x is unchanged.
+- **OpenCode 2.x flattened error payloads**: Parses both OpenCode 1.x nested (`error.name` + `error.data.message`) and 2.x flattened (`error.type` + `error.message` + `error.status`) error events, including pre-session errors without a `sessionID`, so upstream rate limits surface as typed `rate_limited` errors instead of `MalformedOutput`.
+- **Claude quota window events**: Extracts Claude's message-free rejected `rate_limit_event` for `five_hour` and `seven_day` account windows as a typed `provider_limit` with bounded quota text.
+- **Codex transport retry filtering**: Skips `Reconnecting... n/m` progress notices in provider error extraction so transient reconnect lines do not mask the terminal error (such as a `401` from a revoked login), and parses `unexpected status NNN` HTTP status codes.
+
+### Isolation & security
+
+- **OpenCode probe & overlay environment hardening**: `ProbeRequest` restricts environment overrides to `OPENCODE_OVERLAY_ENVIRONMENT_KEYS` and scrubs Ruby/Bundler injection variables (`RUBYOPT`, `RUBYLIB`, `GEM_HOME`, `GEM_PATH`, `BUNDLE_BIN_PATH`, `BUNDLE_GEMFILE`) last; both `ProbeRequest` and `OpenCodePreparationRequest` reject credential keys overlapping `SCRUBBED_RUNTIME_ENVIRONMENT_KEYS`.
+
+## 0.2.4 - 2026-08-25
+
+- Expose the OpenCode permission compiler independently from the prepared
+  overlay so callers can supply the same deny-first rules through native
+  per-process configuration without duplicating policy generation.
+
+- Carry the already-resolved OpenCode executable on `ProbeRequest` (`executable:`)
+  instead of re-encoding it as the `AGENT_CLI_RUNTIME_OPENCODE_BIN` environment
+  override. The route-aware probe now resolves the executable once — honoring a
+  caller-supplied value first — and threads that single value through the
+  installation check, version check, every local inspection command, and the
+  reported result executable. `Profile#binary_installed?`,
+  `Profile#check_version!`, and `Profile#capture_local` accept an optional
+  `executable:` override; existing environment-based resolution is unchanged
+  when no explicit value is carried.
+
+## 0.2.3 - 2026-08-21
+
+- Classify extracted provider failures once at the runtime boundary as
+  `provider_limit`, `rate_limited`, `model_output_limit`, or `provider_error`.
+  HTTP 402/429 payloads are authoritative even when their provider-specific
+  wording does not match an orchestrator's legacy quota phrases.
+
+## 0.2.2 - 2026-08-18
+
+- Deliver built-in Pi prompts through its native non-TTY stdin reader instead
+  of one positional argv element. This prevents implementation-sized prompts
+  from failing at process spawn with the operating system's per-argument
+  `E2BIG` limit; Codex retains its separate stdin-plus-`-` transport.
+- Treat Pi's `stopReason: "length"` as a typed `model_output_limit` failure.
+  Pi exits zero after this provider stop even when the model exhausted its
+  output allowance before writing the requested artifact; callers can now
+  distinguish that incomplete turn from an agent that silently produced
+  0 bytes and tell operators to raise `maxTokens` or lower reasoning effort.
+- Declare Grok's filesystem sandbox flags, so a caller asking for confined
+  execution gets it instead of being told Grok cannot confine. `--sandbox
+  workspace` limits writes to the working directory and `--sandbox read-only`
+  forbids them, both built-in profiles that custom ones extend from
+  `~/.grok/sandbox.toml`; `--always-approve` suppresses the approval prompt a
+  headless run can never answer, leaving the sandbox — not the prompt — as the
+  boundary. Only the Grok profile changes.
+
+## 0.2.1 - 2026-08-17
+
+- Add per-profile provider-error extraction so a refusal a CLI reports on its
+  event stream is distinguishable from an agent that genuinely produced
+  nothing. `extract_provider_error` returns the provider, the HTTP status when
+  the provider supplied one, and the redacted provider text.
+- Add the `pi` extractor for turns that keep the envelope type and carry the
+  refusal in `stopReason`/`errorMessage`, which no event-type match observes.
+  Such turns previously reached the caller as a clean run with empty content
+  while the process exited zero.
+- Default every other profile to the previously assumed shapes — dedicated
+  `error`, `turn.failed`, and `rate_limit_event` events plus failed `result`
+  events — so no existing profile changes behaviour.
+- Read usage from the assistant message and accept the bare
+  `input`/`output`/`cacheRead`/`cacheWrite` spellings, so a provider reporting
+  usage there is metered instead of silently recording nothing. The bare
+  spellings are matched last, leaving a provider that reports explicit
+  `*_tokens` keys with its existing reading.
+
+## 0.2.0 - 2026-08-15
+
+- Add first-class OpenCode `1.18.16+` support alongside the built-in Claude
+  Code, Codex CLI, Pi, and Grok CLI profiles. OpenCode uses the shared request
+  and facade, then adds provider-specific preparation, route probing, and
+  strict result normalization.
+- Route every OpenCode run to an exact `provider/model` and validate model
+  variants, preserving the route the application requested and the route the
+  captured result reports.
+- Prepare owner-private OpenCode config, data, cache, and state overlays for
+  each invocation, with scoped `read-only` and `workspace-write` policies,
+  deliberate credential forwarding, and idempotent cleanup.
+- Check run/export capabilities, selected authentication source, cached model
+  inventory, and the exact requested route locally before an application
+  starts work.
+- Correlate run and sanitized-export evidence into typed outcomes for
+  completion, authentication, configuration, CLI failure, malformed output,
+  cancellation, and timeout.
+- Report input, output, cache-read, cache-write, reasoning, and cost evidence
+  while preserving the difference between unavailable data and numeric zero.
+- Return prepared commands and normalized evidence through lifecycle-safe
+  values that fit an application's existing streaming, timeout, cancellation,
+  retry, and process-supervision stack.
+
+## 0.1.1 - 2026-08-11
+
+- Expose each profile's immutable credential-environment key inventory so
+  orchestrators can isolate named subscription/session bindings without
+  embedding provider-specific compatibility tables.
+- Expose each profile's configuration-directory override and home-relative
+  default so orchestrators can detect subscription-session aliases without
+  maintaining a second provider-specific table.
+- Include Claude's ambient auth-token override in the isolation inventory so a
+  named subscription binding cannot be silently replaced by caller state.
+- Preserve an optional immutable provider signal in observable results so a
+  trusted orchestrator can carry structured transport evidence without moving
+  provider-health classification into the compatibility package.
+
+## 0.1.0 - 2026-07-26
+
+- Add immutable profiles for Claude Code, Codex CLI, Pi, and Grok CLI.
+- Add provider-neutral invocation compilation, local prerequisite probes,
+  capability evidence, usage extraction, and result normalization.
+- Add the `agent-runtime probe` diagnostic executable with versioned JSON and
+  stable exit statuses.
+- Keep missing provider usage unknown instead of recording fabricated zero
+  counts, and preserve typed unknown-provider errors through the public facade.
+- Harden local probing around subprocess environments, ambiguous version
+  output, TERM-resistant descendants, custom capability evidence, unused Grok
+  credential paths, and long or JSON-delimited secrets.

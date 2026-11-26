@@ -1,0 +1,249 @@
+require_relative "test_helper"
+
+class AgentCliRuntimeErrorExtractorsTest < Minitest::Test
+  # Verbatim envelope from a pi run whose OpenRouter key hit its ceiling: the
+  # type stays "message_start", content is empty, and the refusal lives in
+  # stopReason/errorMessage while the process still exits zero.
+  PI_REFUSAL = JSON.parse(
+    File.read(File.join(__dir__, "fixtures", "pi_provider_limit.json"))
+  ).freeze
+
+  PI_SUCCESS = {
+    "type" => "message_end",
+    "message" => {
+      "role" => "assistant",
+      "provider" => "openrouter",
+      "model" => "deepseek/deepseek-v4-pro",
+      "stopReason" => "stop"
+    }
+  }.freeze
+
+  PI_OUTPUT_TRUNCATED = {
+    "type" => "message_end",
+    "message" => {
+      "role" => "assistant",
+      "provider" => "openrouter",
+      "model" => "deepseek/deepseek-v4-pro",
+      "usage" => { "input" => 8_079, "output" => 8_192 },
+      "stopReason" => "length",
+      "rawStopReason" => "length"
+    }
+  }.freeze
+
+  def test_pi_refusal_is_extracted_with_its_status_code
+    error = AgentCliRuntime.extract_provider_error(:pi, PI_REFUSAL)
+
+    refute_nil error, "a stopReason=error turn must surface as a provider error"
+    assert_equal :provider_limit, error[:kind]
+    assert_equal :pi, error[:provider]
+    assert_equal 402, error[:status_code]
+    assert_includes error[:message], "Prompt tokens limit exceeded"
+    assert_predicate error, :frozen?
+  end
+
+  def test_pi_completed_turn_is_not_an_error
+    assert_nil AgentCliRuntime.extract_provider_error(:pi, PI_SUCCESS)
+  end
+
+  def test_pi_output_truncation_is_a_typed_incomplete_turn
+    error = AgentCliRuntime.extract_provider_error(:pi, PI_OUTPUT_TRUNCATED)
+
+    refute_nil error, "stopReason=length must not read as a successful Pi turn"
+    assert_equal :model_output_limit, error[:kind]
+    assert_equal :pi, error[:provider]
+    assert_nil error[:status_code]
+    assert_equal "model response reached its maximum output tokens", error[:message]
+  end
+
+  def test_pi_refusal_without_a_status_code_still_reports_the_message
+    event = {
+      "type" => "message_end",
+      "message" => { "stopReason" => "error", "errorMessage" => "upstream refused" }
+    }
+    error = AgentCliRuntime.extract_provider_error(:pi, event)
+
+    assert_equal :provider_error, error[:kind]
+    assert_equal "upstream refused", error[:message]
+    assert_nil error[:status_code]
+  end
+
+  def test_default_extractor_reads_dedicated_error_events
+    error = AgentCliRuntime.extract_provider_error(
+      :codex, { "type" => "error", "message" => "429: rate limit reached" }
+    )
+
+    assert_equal :rate_limited, error[:kind]
+    assert_equal 429, error[:status_code]
+    assert_equal :codex, error[:provider]
+  end
+
+  def test_default_extractor_reads_failed_results
+    error = AgentCliRuntime.extract_provider_error(
+      :claude,
+      { "type" => "result", "is_error" => true, "error" => { "message" => "quota exhausted" } }
+    )
+
+    assert_equal :provider_limit, error[:kind]
+    assert_equal "quota exhausted", error[:message]
+  end
+
+  def test_claude_rejected_subscription_window_is_a_provider_limit
+    error = AgentCliRuntime.extract_provider_error(
+      :claude,
+      {
+        "type" => "rate_limit_event",
+        "rate_limit_info" => {
+          "status" => "rejected",
+          "rateLimitType" => "seven_day",
+          "resetsAt" => 1_788_400_800,
+          "overageDisabledReason" => "out_of_credits"
+        }
+      }
+    )
+
+    assert_equal :provider_limit, error[:kind]
+    assert_equal :claude, error[:provider]
+    assert_nil error[:status_code]
+    assert_equal "Claude account quota reached (seven_day)", error[:message]
+  end
+
+  def test_claude_non_rejected_or_unknown_rate_window_is_not_fabricated
+    [
+      { "status" => "allowed", "rateLimitType" => "seven_day" },
+      { "status" => "rejected", "rateLimitType" => "unknown_window" }
+    ].each do |info|
+      assert_nil AgentCliRuntime.extract_provider_error(
+        :claude,
+        { "type" => "rate_limit_event", "rate_limit_info" => info }
+      )
+    end
+  end
+
+  def test_grok_nested_402_error_is_a_provider_limit
+    event = {
+      "type" => "error",
+      "message" => <<~MESSAGE.strip
+        Internal error: {
+          "message": "API error (status 402 Payment Required): Grok Build usage balance exhausted",
+          "http_status": 402
+        }
+      MESSAGE
+    }
+
+    error = AgentCliRuntime.extract_provider_error(:grok, event)
+
+    refute_nil error, "Grok's dedicated error event must be extracted"
+    assert_equal :provider_limit, error[:kind]
+    assert_equal :grok, error[:provider]
+    assert_equal 402, error[:status_code]
+    assert_includes error[:message], "usage balance exhausted"
+  end
+
+  def test_opencode_extractor_reads_nested_provider_rate_limit
+    event = {
+      "type" => "error",
+      "sessionID" => "ses_rate_limit",
+      "error" => {
+        "name" => "APIError",
+        "data" => {
+          "message" => "[Stealth] stealth/ox-alpha is temporarily rate-limited upstream. Please retry shortly."
+        }
+      }
+    }
+
+    error = AgentCliRuntime.extract_provider_error(:opencode, event)
+
+    assert_equal :rate_limited, error[:kind]
+    assert_equal :opencode, error[:provider]
+    assert_nil error[:status_code]
+    assert_includes error[:message], "temporarily rate-limited upstream"
+  end
+
+  def test_opencode_extractor_reads_opencode_two_flat_error
+    event = {
+      "type" => "error",
+      "sessionID" => "ses_auth",
+      "error" => {
+        "type" => "provider.auth",
+        "message" => "This API key has expired. Create a new API key in OpenCode Console.",
+        "status" => 401
+      }
+    }
+
+    error = AgentCliRuntime.extract_provider_error(:opencode, event)
+
+    assert_equal :opencode, error[:provider]
+    assert_includes error[:message], "This API key has expired"
+    assert_nil AgentCliRuntime.extract_provider_error(
+      :opencode, { "type" => "error", "error" => { "type" => "unknown", "message" => " " } }
+    )
+  end
+
+  def test_ordinary_events_are_not_errors
+    [
+      { "type" => "result", "is_error" => false, "message" => "done" },
+      { "type" => "message_start", "message" => { "stopReason" => "stop" } },
+      { "type" => "stream_event" },
+      "not-a-hash",
+      nil
+    ].each do |event|
+      assert_nil AgentCliRuntime.extract_provider_error(:pi, event),
+                 "#{event.inspect} must not read as a provider error"
+    end
+  end
+
+  def test_extraction_never_raises_on_a_hostile_extractor
+    profile = AgentCliRuntime::Profile.new(
+      name: :exploding, bin_default: "x", version_flag: "--version",
+      headless_flag: "-p", error_extractor: ->(_event) { raise "boom" }
+    )
+
+    assert_nil profile.extract_error_event({ "type" => "error" })
+  end
+
+  def test_secrets_in_provider_text_are_redacted
+    event = {
+      "type" => "error",
+      "message" => "401: bad key sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"
+    }
+    error = AgentCliRuntime.extract_provider_error(:claude, event)
+
+    refute_includes error[:message], "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"
+  end
+
+  CODEX_RETRY = {
+    "type" => "error",
+    "message" => "Reconnecting... 2/5 (unexpected status 401 Unauthorized: Incorrect API key provided: sk-x***)"
+  }.freeze
+  CODEX_TERMINAL = {
+    "type" => "turn.failed",
+    "error" => { "message" => "unexpected status 401 Unauthorized: Incorrect API key provided: sk-x***" }
+  }.freeze
+
+  # Codex emits every transport retry as an "error" event before the real
+  # failure; callers keep the first provider error, so retries must not count.
+  def test_codex_retry_notices_are_not_provider_errors
+    assert_nil AgentCliRuntime.extract_provider_error(:codex, CODEX_RETRY)
+    assert_nil AgentCliRuntime.extract_provider_error(
+      :codex, { "type" => "error", "message" => "Reconnecting... 5/5 (stream disconnected before completion)" }
+    )
+  end
+
+  def test_codex_terminal_failure_keeps_its_status_code
+    error = AgentCliRuntime.extract_provider_error(:codex, CODEX_TERMINAL)
+
+    refute_nil error
+    assert_equal :codex, error[:provider]
+    assert_equal 401, error[:status_code]
+    assert_includes error[:message], "401 Unauthorized"
+  end
+
+  def test_codex_rate_limit_status_is_classified
+    error = AgentCliRuntime.extract_provider_error(
+      :codex, { "type" => "error", "message" => "unexpected status 429 Too Many Requests: slow down" }
+    )
+
+    assert_equal 429, error[:status_code]
+    assert_equal :rate_limited, error[:kind]
+  end
+end
